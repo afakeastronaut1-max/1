@@ -5,39 +5,24 @@ import csv
 import io
 import json
 import re
+import shutil
+import subprocess
 import sys
 import tarfile
-import time
-import urllib.parse
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 TARGET_DATE = "2026-07-24"
-TARGET_END = "20260724"
 ROOT = Path(__file__).resolve().parent
+WORK = ROOT / "work"
 RESULT_DIR = ROOT / "results"
-UNIVERSE_URLS = [
-    "https://82.push2.eastmoney.com/api/qt/clist/get",
-    "https://push2.eastmoney.com/api/qt/clist/get",
+ARCHIVE_URLS = [
+    "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz",
+    "https://github.com/chenditc/investment_data/releases/download/2026-07-25/qlib_bin.tar.gz",
 ]
-HISTORY_HOSTS = [
-    "https://push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://71.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://53.push2his.eastmoney.com/api/qt/stock/kline/get",
-]
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Venus8Scan/1.0"
-
-
-def get_json(base: str, params: dict[str, Any], timeout: int = 25) -> dict[str, Any]:
-    url = base + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-    return json.loads(raw.decode("utf-8", errors="replace"))
 
 
 def prepare_runtime() -> None:
@@ -49,85 +34,119 @@ def prepare_runtime() -> None:
     sys.path.insert(0, str(vendor))
 
 
-def load_universe() -> list[dict[str, str]]:
-    params = {
-        "pn": 1, "pz": 10000, "po": 1, "np": 1, "fltt": 2, "invt": 2,
-        "fid": "f3",
-        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
-        "fields": "f12,f13,f14",
-    }
-    last: Exception | None = None
-    for base in UNIVERSE_URLS:
+def download_archive() -> tuple[Path, str]:
+    WORK.mkdir(exist_ok=True)
+    archive = WORK / "qlib_bin.tar.gz"
+    last = None
+    for url in ARCHIVE_URLS:
+        archive.unlink(missing_ok=True)
+        cmd = [
+            "curl", "-L", "--fail", "--retry", "4", "--retry-all-errors",
+            "--connect-timeout", "30", "--max-time", "1200", "-o", str(archive), url,
+        ]
         try:
-            payload = get_json(base, params, timeout=40)
-            diff = (((payload or {}).get("data") or {}).get("diff") or [])
-            items = list(diff.values()) if isinstance(diff, dict) else list(diff)
-            rows = []
-            seen = set()
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                code = str(item.get("f12") or "").zfill(6)
-                name = str(item.get("f14") or "")
-                if not code.isdigit() or code in seen:
-                    continue
-                if code.startswith(("600", "601", "603", "605", "688", "689")):
-                    market = "1"
-                elif code.startswith(("000", "001", "002", "003", "300", "301", "4", "8", "9")):
-                    market = "0"
-                else:
-                    continue
-                seen.add(code)
-                rows.append({"code": code, "market": market, "name": name})
-            print(f"universe raw_items={len(items)} parsed={len(rows)} from {base}", flush=True)
-            if len(rows) > 3000:
-                return rows
-            last = RuntimeError(f"universe response too small: raw={len(items)} parsed={len(rows)}")
+            subprocess.run(cmd, check=True)
+            if archive.stat().st_size < 10_000_000 or not tarfile.is_tarfile(archive):
+                raise RuntimeError(f"invalid or too-small qlib archive: {archive.stat().st_size}")
+            print(f"archive={archive.stat().st_size / 1024 / 1024:.1f}MB url={url}", flush=True)
+            return archive, url
         except Exception as exc:
             last = exc
-            print(f"universe source failed {base}: {exc}", flush=True)
-    raise RuntimeError(f"unable to load full A-share universe: {last}")
+            print(f"archive source failed {url}: {exc}", flush=True)
+    raise RuntimeError(f"all qlib archive sources failed: {last}")
 
 
-def fetch_bars(stock: dict[str, str]) -> tuple[dict[str, str], pd.DataFrame | None, str | None]:
-    params = {
-        "secid": f"{stock['market']}.{stock['code']}",
-        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
-        "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-        "klt": 101,
-        "fqt": 1,
-        "beg": 0,
-        "end": TARGET_END,
-        "lmt": 320,
-    }
-    err = None
-    for attempt in range(4):
-        base = HISTORY_HOSTS[(hash(stock["code"]) + attempt) % len(HISTORY_HOSTS)]
-        try:
-            payload = get_json(base, params, timeout=25)
-            data = (payload or {}).get("data") or {}
-            klines = data.get("klines") or []
-            rows = []
-            for line in klines:
-                p = str(line).split(",")
-                if len(p) < 7:
-                    continue
-                try:
-                    rows.append({
-                        "date": p[0], "open": float(p[1]), "close": float(p[2]),
-                        "high": float(p[3]), "low": float(p[4]), "volume": float(p[5]),
-                        "turnover": float(p[6]),
-                    })
-                except ValueError:
-                    continue
-            if len(rows) < 80 or rows[-1]["date"] != TARGET_DATE:
-                return stock, None, "insufficient_or_suspended"
-            return stock, pd.DataFrame(rows[-300:]), None
-        except Exception as exc:
-            err = f"{type(exc).__name__}: {exc}"
-            time.sleep(0.35 * (attempt + 1))
-    return stock, None, err
+def extract_archive(archive: Path) -> Path:
+    target = WORK / "qlib_data"
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True)
+    with tarfile.open(archive, "r:gz") as tf:
+        tf.extractall(target)
+    calendars = list(target.rglob("calendars/day.txt"))
+    if not calendars:
+        raise RuntimeError("qlib calendar not found after extraction")
+    data_root = calendars[0].parent.parent
+    required = [data_root / "instruments" / "all.txt", data_root / "features"]
+    if not all(p.exists() for p in required):
+        raise RuntimeError(f"invalid qlib root: {data_root}")
+    print(f"qlib_root={data_root}", flush=True)
+    return data_root
+
+
+def read_calendar(root: Path) -> list[str]:
+    values = []
+    for line in (root / "calendars" / "day.txt").read_text(encoding="utf-8").splitlines():
+        date = line.strip()[:10]
+        if date:
+            values.append(date)
+    if TARGET_DATE not in values:
+        raise RuntimeError(f"target date missing; calendar_last={values[-1] if values else None}")
+    print(f"calendar_last={values[-1]} target_index={values.index(TARGET_DATE)}", flush=True)
+    return values
+
+
+def read_instruments(root: Path) -> list[tuple[str, str, str]]:
+    rows = []
+    for line in (root / "instruments" / "all.txt").read_text(encoding="utf-8").splitlines():
+        p = re.split(r"\s+", line.strip())
+        if len(p) >= 3:
+            rows.append((p[0].upper(), p[1][:10], p[2][:10]))
+    return rows
+
+
+def valid_symbol(symbol: str) -> bool:
+    s = symbol.upper()
+    if s.startswith("SH"):
+        return s[2:].startswith(("600", "601", "603", "605", "688", "689"))
+    if s.startswith("SZ"):
+        return s[2:].startswith(("000", "001", "002", "003", "300", "301"))
+    if s.startswith("BJ"):
+        return s[2:].isdigit()
+    return False
+
+
+def read_feature(path: Path, calendar_len: int) -> np.ndarray | None:
+    if not path.exists():
+        return None
+    raw = np.fromfile(path, dtype="<f4")
+    if raw.size < 2:
+        return None
+    start = int(round(float(raw[0])))
+    if start < 0 or start >= calendar_len:
+        return None
+    out = np.full(calendar_len, np.nan, dtype=float)
+    values = raw[1:].astype(float)
+    end = min(calendar_len, start + values.size)
+    out[start:end] = values[: end - start]
+    return out
+
+
+def build_frame(root: Path, symbol: str, calendar: list[str], target_idx: int) -> pd.DataFrame | None:
+    folder = root / "features" / symbol.lower()
+    if not folder.exists():
+        return None
+    arrays: dict[str, np.ndarray] = {}
+    for field in ("open", "high", "low", "close", "volume", "amount"):
+        value = read_feature(folder / f"{field}.day.bin", len(calendar))
+        if value is not None:
+            arrays[field] = value
+    if not {"open", "high", "low", "close", "volume"}.issubset(arrays):
+        return None
+    start = max(0, target_idx - 299)
+    frame = pd.DataFrame({
+        "date": calendar[start : target_idx + 1],
+        "open": arrays["open"][start : target_idx + 1],
+        "high": arrays["high"][start : target_idx + 1],
+        "low": arrays["low"][start : target_idx + 1],
+        "close": arrays["close"][start : target_idx + 1],
+        "volume": arrays["volume"][start : target_idx + 1],
+        "turnover": arrays.get("amount", np.full(len(calendar), np.nan))[start : target_idx + 1],
+    })
+    frame = frame.replace([np.inf, -np.inf], np.nan).dropna(subset=["open", "high", "low", "close"])
+    if len(frame) < 80 or frame.iloc[-1]["date"] != TARGET_DATE:
+        return None
+    return frame.reset_index(drop=True)
 
 
 def clean_name(name: str) -> bool:
@@ -139,14 +158,21 @@ def compact(item: dict[str, Any], rank: int) -> dict[str, Any]:
     raw = item.get("raw_metrics") or {}
     def s(key: str): return (dims.get(key) or {}).get("score")
     return {
-        "rank": rank, "code": item.get("symbol"), "name": item.get("name"),
-        "score": item.get("total_score"), "trend": s("trend_structure"),
-        "pullback": s("pullback_quality"), "momentum": s("momentum_repair"),
-        "volume": s("volume_activity"), "price_confirmation": s("price_confirmation"),
-        "boll": s("boll_prediction"), "close": raw.get("close"),
+        "rank": rank,
+        "code": item.get("symbol"),
+        "name": item.get("name"),
+        "score": item.get("total_score"),
+        "trend": s("trend_structure"),
+        "pullback": s("pullback_quality"),
+        "momentum": s("momentum_repair"),
+        "volume": s("volume_activity"),
+        "price_confirmation": s("price_confirmation"),
+        "boll": s("boll_prediction"),
+        "close": raw.get("close"),
         "daily_change_pct": raw.get("daily_change_pct"),
         "drawdown_60d_high_pct": raw.get("drawdown_from_60d_high_pct"),
-        "ret_20d_pct": raw.get("ret_20d_pct"), "ret_60d_pct": raw.get("ret_60d_pct"),
+        "ret_20d_pct": raw.get("ret_20d_pct"),
+        "ret_60d_pct": raw.get("ret_60d_pct"),
         "action_stance": item.get("action_stance"),
         "supports": (item.get("key_evidence") or {}).get("supports") or [],
         "risk_points": item.get("risk_points") or [],
@@ -157,60 +183,88 @@ def main() -> None:
     prepare_runtime()
     from src.analysis.golden_pit import score_golden_pit
 
-    universe = load_universe()
+    archive, archive_url = download_archive()
+    data_root = extract_archive(archive)
+    calendar = read_calendar(data_root)
+    target_idx = calendar.index(TARGET_DATE)
+    instruments = read_instruments(data_root)
+
     candidates: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
     scored = 0
-    completed = 0
-    with ThreadPoolExecutor(max_workers=48) as pool:
-        futures = [pool.submit(fetch_bars, stock) for stock in universe]
-        for fut in as_completed(futures):
-            stock, frame, error = fut.result()
-            completed += 1
-            if frame is not None:
-                try:
-                    scored += 1
-                    payload = score_golden_pit(stock["code"], frame, name=stock["name"], period="daily")
-                    payload["market_id"] = stock["market"]
-                    if payload.get("grade") == "A" or payload.get("is_near_a_grade"):
-                        candidates.append(payload)
-                except Exception as exc:
-                    failures.append({"code": stock["code"], "error": f"score:{type(exc).__name__}: {exc}"})
-            elif error and error != "insufficient_or_suspended":
-                failures.append({"code": stock["code"], "error": error})
-            if completed % 250 == 0:
-                print(f"progress={completed}/{len(universe)} scored={scored} candidates={len(candidates)} failures={len(failures)}", flush=True)
+    selected_universe = 0
+    for index, (symbol, start_date, end_date) in enumerate(instruments, 1):
+        if not valid_symbol(symbol) or start_date > TARGET_DATE or end_date < TARGET_DATE:
+            continue
+        selected_universe += 1
+        try:
+            frame = build_frame(data_root, symbol, calendar, target_idx)
+            if frame is None:
+                continue
+            scored += 1
+            code = symbol[2:]
+            payload = score_golden_pit(code, frame, name="", period="daily")
+            payload["exchange_symbol"] = symbol
+            if payload.get("grade") == "A" or payload.get("is_near_a_grade"):
+                candidates.append(payload)
+        except Exception as exc:
+            failures.append({"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"})
+        if selected_universe % 500 == 0:
+            print(f"progress={selected_universe} scored={scored} candidates={len(candidates)} failures={len(failures)}", flush=True)
 
     candidates.sort(key=lambda x: (x.get("grade") == "A", int(x.get("total_score") or 0)), reverse=True)
     grade_a = [x for x in candidates if x.get("grade") == "A"]
     clean_a = [x for x in grade_a if clean_name(str(x.get("name") or ""))]
     near_a = [x for x in candidates if x.get("grade") != "A"]
-    rows = [compact(x, i) for i, x in enumerate(clean_a, 1)]
+    rows = [compact(item, rank) for rank, item in enumerate(clean_a, 1)]
+
     output = {
-        "schema": "venus8_full_market_technical_a_scan.v4",
+        "schema": "venus8_full_market_technical_a_scan.v5",
         "target_date": TARGET_DATE,
         "method": "exact Venus8 src.analysis.golden_pit.score_golden_pit",
         "technical_a_rule": "total_score >= 85 and no Venus8 hard exclusion",
         "data_source": {
-            "provider": "Eastmoney multi-host daily K-line API",
-            "adjustment": "fqt=1 forward-adjusted (qfq)",
-            "bar_limit": 320,
+            "provider": "chenditc/investment_data Qlib daily full-market release",
+            "archive_url": archive_url,
+            "calendar_last": calendar[-1],
+            "price_basis": "Qlib continuous adjusted OHLCV",
         },
-        "universe": {"listed_a_shares": len(universe), "scored_with_80_bars_and_target_close": scored, "request_or_score_failures": len(failures)},
-        "counts": {"technical_a_all": len(grade_a), "technical_a_clean": len(clean_a), "near_a": len(near_a)},
-        "technical_a": grade_a, "technical_a_clean": clean_a, "near_a": near_a[:120], "failures_sample": failures[:100],
+        "universe": {
+            "instrument_rows": len(instruments),
+            "active_a_share_symbols": selected_universe,
+            "scored_with_80_bars_and_target_close": scored,
+            "score_failures": len(failures),
+        },
+        "counts": {
+            "technical_a_all": len(grade_a),
+            "technical_a_clean": len(clean_a),
+            "near_a": len(near_a),
+        },
+        "technical_a": grade_a,
+        "technical_a_clean": clean_a,
+        "near_a": near_a[:150],
+        "failures_sample": failures[:100],
     }
     RESULT_DIR.mkdir(exist_ok=True)
     (RESULT_DIR / "venus8_technical_a_20260724.json").write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     fields = list(rows[0].keys()) if rows else ["rank", "code", "name", "score"]
     with (RESULT_DIR / "venus8_technical_a_20260724.csv").open("w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(rows)
-    lines = [f"# Venus8 全市场技术A扫描（{TARGET_DATE}）", "", f"- 全市场：{len(universe)}只", f"- 实际评分：{scored}只", f"- 技术A：{len(grade_a)}只", f"- 清理ST/退市/新股前缀后：{len(clean_a)}只", f"- 接近A：{len(near_a)}只", "", "|排名|代码|名称|总分|趋势|回调|动能|量能|价格确认|BOLL|收盘|当日涨跌%|", "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
-    for r in rows:
-        lines.append(f"|{r['rank']}|{r['code']}|{r['name']}|{r['score']}|{r['trend']}|{r['pullback']}|{r['momentum']}|{r['volume']}|{r['price_confirmation']}|{r['boll']}|{r['close']}|{r['daily_change_pct']}|")
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    lines = [
+        f"# Venus8 全市场技术A扫描（{TARGET_DATE}）", "",
+        f"- 活跃A股：{selected_universe}只", f"- 实际评分：{scored}只",
+        f"- 技术A：{len(grade_a)}只", f"- 接近A：{len(near_a)}只", "",
+        "|排名|代码|总分|趋势|回调|动能|量能|价格确认|BOLL|收盘|当日涨跌%|",
+        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        lines.append(f"|{row['rank']}|{row['code']}|{row['score']}|{row['trend']}|{row['pullback']}|{row['momentum']}|{row['volume']}|{row['price_confirmation']}|{row['boll']}|{row['close']}|{row['daily_change_pct']}|")
     (RESULT_DIR / "venus8_technical_a_20260724.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
     print("VENUS_RESULT_BEGIN")
-    print(json.dumps({"counts": output["counts"], "universe": output["universe"], "top": rows[:40]}, ensure_ascii=False))
+    print(json.dumps({"counts": output["counts"], "universe": output["universe"], "top": rows[:50]}, ensure_ascii=False))
     print("VENUS_RESULT_END")
 
 
