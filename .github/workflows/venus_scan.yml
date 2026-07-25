@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'scan_venus.py'
+      - 'scan_repair2.py'
       - 'venus_runtime.b64'
       - '.github/workflows/venus_scan.yml'
   pull_request:
@@ -25,11 +25,11 @@ jobs:
           python-version: '3.11'
       - name: Install scanner dependencies
         run: python -m pip install --upgrade pip && python -m pip install pandas numpy pydantic
-      - name: Run exact Venus8 full-market scan
+      - name: Run final coverage-repaired Venus8 full-market scan
         shell: bash
         run: |
           set -o pipefail
-          python scan_venus.py 2>&1 | tee venus_scan.log
+          python scan_repair2.py 2>&1 | tee venus_scan.log
       - name: Upload results and log
         if: always()
         uses: actions/upload-artifact@v4
