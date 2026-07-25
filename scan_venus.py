@@ -56,21 +56,33 @@ def load_universe() -> list[dict[str, str]]:
         "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
         "fields": "f12,f13,f14",
     }
-    last = None
+    last: Exception | None = None
     for base in UNIVERSE_URLS:
         try:
             payload = get_json(base, params, timeout=40)
             diff = (((payload or {}).get("data") or {}).get("diff") or [])
+            items = list(diff.values()) if isinstance(diff, dict) else list(diff)
             rows = []
-            for item in diff:
+            seen = set()
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
                 code = str(item.get("f12") or "").zfill(6)
-                market = str(item.get("f13") if item.get("f13") is not None else "")
                 name = str(item.get("f14") or "")
-                if code.isdigit() and market in {"0", "1"}:
-                    rows.append({"code": code, "market": market, "name": name})
-            if len(rows) > 4000:
-                print(f"universe={len(rows)} from {base}", flush=True)
+                if not code.isdigit() or code in seen:
+                    continue
+                if code.startswith(("600", "601", "603", "605", "688", "689")):
+                    market = "1"
+                elif code.startswith(("000", "001", "002", "003", "300", "301", "4", "8", "9")):
+                    market = "0"
+                else:
+                    continue
+                seen.add(code)
+                rows.append({"code": code, "market": market, "name": name})
+            print(f"universe raw_items={len(items)} parsed={len(rows)} from {base}", flush=True)
+            if len(rows) > 3000:
                 return rows
+            last = RuntimeError(f"universe response too small: raw={len(items)} parsed={len(rows)}")
         except Exception as exc:
             last = exc
             print(f"universe source failed {base}: {exc}", flush=True)
@@ -175,7 +187,7 @@ def main() -> None:
     near_a = [x for x in candidates if x.get("grade") != "A"]
     rows = [compact(x, i) for i, x in enumerate(clean_a, 1)]
     output = {
-        "schema": "venus8_full_market_technical_a_scan.v3",
+        "schema": "venus8_full_market_technical_a_scan.v4",
         "target_date": TARGET_DATE,
         "method": "exact Venus8 src.analysis.golden_pit.score_golden_pit",
         "technical_a_rule": "total_score >= 85 and no Venus8 hard exclusion",
